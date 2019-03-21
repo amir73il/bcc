@@ -31,6 +31,7 @@ from socket import inet_ntop, AF_INET, AF_INET6
 from struct import pack
 from time import sleep, strftime
 from subprocess import call
+import ctypes as ct
 from collections import namedtuple, defaultdict
 
 # arguments

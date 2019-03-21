@@ -59,9 +59,11 @@
 from __future__ import print_function
 from bcc import BPF, PerfType, PerfSWConfig
 from time import sleep, strftime
+from ctypes import c_int
 import argparse
 import multiprocessing
 from os import getpid, system, open, close, dup, unlink, O_WRONLY
+import ctypes as ct
 from tempfile import NamedTemporaryFile
 
 # arguments
@@ -246,6 +248,12 @@ if args.csv:
 else:
     print(("Sampling run queues... Output every %s seconds. " +
           "Hit Ctrl-C to end.") % args.interval)
+class Data(ct.Structure):
+    _fields_ = [
+        ("ts", ct.c_ulonglong),
+        ("cpu", ct.c_ulonglong),
+        ("len", ct.c_ulonglong)
+    ]
 
 samples = {}
 group = {}
@@ -253,7 +261,7 @@ last = 0
 
 # process event
 def print_event(cpu, data, size):
-    event = b["events"].event(data)
+    event = ct.cast(data, ct.POINTER(Data)).contents
     samples[event.ts] = {}
     samples[event.ts]['cpu'] = event.cpu
     samples[event.ts]['len'] = event.len

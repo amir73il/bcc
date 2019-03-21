@@ -27,6 +27,7 @@ from bcc import BPF
 import argparse
 from socket import inet_ntop, ntohs, AF_INET, AF_INET6
 from struct import pack
+import ctypes as ct
 from time import strftime
 
 # arguments
@@ -390,6 +391,35 @@ if debug or args.ebpf:
     if args.ebpf:
         exit()
 
+# event data
+TASK_COMM_LEN = 16      # linux/sched.h
+
+class Data_ipv4(ct.Structure):
+    _fields_ = [
+        ("ts_us", ct.c_ulonglong),
+        ("pid", ct.c_uint),
+        ("saddr", ct.c_uint),
+        ("daddr", ct.c_uint),
+        ("ports", ct.c_ulonglong),
+        ("rx_b", ct.c_ulonglong),
+        ("tx_b", ct.c_ulonglong),
+        ("span_us", ct.c_ulonglong),
+        ("task", ct.c_char * TASK_COMM_LEN)
+    ]
+
+class Data_ipv6(ct.Structure):
+    _fields_ = [
+        ("ts_us", ct.c_ulonglong),
+        ("pid", ct.c_uint),
+        ("saddr", (ct.c_ulonglong * 2)),
+        ("daddr", (ct.c_ulonglong * 2)),
+        ("ports", ct.c_ulonglong),
+        ("rx_b", ct.c_ulonglong),
+        ("tx_b", ct.c_ulonglong),
+        ("span_us", ct.c_ulonglong),
+        ("task", ct.c_char * TASK_COMM_LEN)
+    ]
+
 #
 # Setup output formats
 #
@@ -409,7 +439,7 @@ if args.csv:
 
 # process event
 def print_ipv4_event(cpu, data, size):
-    event = b["ipv4_events"].event(data)
+    event = ct.cast(data, ct.POINTER(Data_ipv4)).contents
     global start_ts
     if args.time:
         if args.csv:
@@ -431,7 +461,7 @@ def print_ipv4_event(cpu, data, size):
         event.tx_b / 1024, event.rx_b / 1024, float(event.span_us) / 1000))
 
 def print_ipv6_event(cpu, data, size):
-    event = b["ipv6_events"].event(data)
+    event = ct.cast(data, ct.POINTER(Data_ipv6)).contents
     global start_ts
     if args.time:
         if args.csv:
