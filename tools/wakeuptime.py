@@ -139,7 +139,10 @@ int waker(struct pt_regs *ctx, struct task_struct *p) {
     bpf_probe_read(&key.target, sizeof(key.target), p->comm);
     bpf_get_current_comm(&key.waker, sizeof(key.waker));
 
-    counts.increment(key, delta);
+    //counts.increment(key, delta);
+    u64 zero = 0, *val;
+    val = counts.lookup_or_init(&key, &zero);
+    (*val) += delta;
     return 0;
 }
 """

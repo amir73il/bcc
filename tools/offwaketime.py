@@ -212,7 +212,11 @@ int oncpu(struct pt_regs *ctx, struct task_struct *p) {
         wokeby.delete(&pid);
     }
 
-    counts.increment(key, delta);
+    //counts.increment(key, delta);
+    u64 zero = 0, *val;
+    val = counts.lookup_or_init(&key, &zero);
+    (*val) += delta;
+
     return 0;
 }
 """
