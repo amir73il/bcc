@@ -62,6 +62,7 @@ APPS = \
 	fsdist \
 	fsslower \
 	fuseqsnoop \
+	fuseqslower \
 	funclatency \
 	gethostlatency \
 	hardirqs \
