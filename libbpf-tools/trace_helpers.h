@@ -19,6 +19,8 @@ const struct ksym *ksyms__map_addr(const struct ksyms *ksyms,
 				   unsigned long addr);
 const struct ksym *ksyms__get_symbol(const struct ksyms *ksyms,
 				     const char *name);
+const struct ksym *ksyms__get_symbol_prefix(const struct ksyms *ksyms,
+					    const char *prefix);
 
 struct sym {
 	const char *name;

@@ -182,6 +182,29 @@ const struct ksym *ksyms__get_symbol(const struct ksyms *ksyms,
 	return NULL;
 }
 
+/*
+ * Find the first symbol whose name equals 'prefix' or starts with "prefix."
+ * This handles compiler-mangled names such as foo.constprop.0, which the
+ * compiler may emit for static functions that get constant-propagated.
+ * Returns the first match, or NULL if none is found.
+ */
+const struct ksym *ksyms__get_symbol_prefix(const struct ksyms *ksyms,
+					    const char *prefix)
+{
+	size_t plen = strlen(prefix);
+	int i;
+
+	for (i = 0; i < ksyms->syms_sz; i++) {
+		const char *n = ksyms->syms[i].name;
+
+		if (strncmp(n, prefix, plen) == 0 &&
+		    (n[plen] == '\0' || n[plen] == '.'))
+			return &ksyms->syms[i];
+	}
+
+	return NULL;
+}
+
 struct load_range {
 	uint64_t start;
 	uint64_t end;
