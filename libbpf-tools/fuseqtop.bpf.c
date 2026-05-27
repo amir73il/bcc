@@ -3,29 +3,21 @@
 //
 // Maintain in-flight FUSE request state for fuseqtop.
 //
-// Three maps are maintained for userspace to poll periodically:
-//   in_flight:         req_ptr -> req_info  (all requests, Q state until R)
-//   workers:           pid_tgid -> worker_info  (daemon threads in D state)
-//   conn_pending_head: conn_id -> head_unique  (Q/D watermark)
+// Two probe strategies, selected at runtime by fuseqtop.c:
 //
-// Q/D classification (watermark approach):
-//   At fuse_dev_read/fuse_dev_do_read exit, the daemon has just dequeued a
-//   request and fiq->pending now reflects the updated queue.  We peek at
-//   pending.next to read the unique ID of the OLDEST remaining queued request
-//   (the "watermark").  Any in_flight request with unique < watermark has
-//   already been dequeued (D state).  If the queue is empty, all in_flight
-//   requests are in D state (watermark stored as 0).
+// Tracepoint path (preferred, kernels with fuse_request_sent tracepoint):
+//   in_flight keyed by unique; d_ts set directly at fuse_request_sent time.
+//   workers updated at fuse_request_sent / cleared at fuse_request_end.
+//   conn_pending_head is not used; userspace classifies Q/D via d_ts alone.
 //
-//   Userspace reads conn_pending_head[conn_id] and classifies each in_flight
-//   entry accordingly.  D timestamps are maintained in userspace between
-//   polling intervals; see fuseqtop.c display_snapshot().
-//
-// First-dequeue limitation:
-//   Daemon threads that were already blocking in fuse_dev_read when the probe
-//   was attached miss their first return (kretprobe "first call" limitation).
-//   Until those threads complete one full cycle, their dequeues are invisible
-//   and affected requests remain classified as Q.  This is a startup artifact
-//   only; a kernel fuse_request_dequeue tracepoint would eliminate it.
+// Kprobe path (fallback, older kernels):
+//   in_flight keyed by req_ptr; Q/D watermark maintained in conn_pending_head.
+//   At fuse_dev_read/fuse_dev_do_read exit, peek at fiq->pending.next to
+//   determine the oldest queued unique ID.  Userspace reads conn_pending_head
+//   and writes d_ts into in_flight entries that crossed the watermark.
+//   First-dequeue limitation: daemon threads already blocking in fuse_dev_read
+//   when the probe was attached miss their first return (kretprobe limitation).
+//   Those requests stay classified as Q until the thread completes one cycle.
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
@@ -328,6 +320,117 @@ int BPF_KPROBE(fuse_request_end_entry)
 
 	bpf_map_delete_elem(&in_flight, &req_ptr);
 	bpf_map_delete_elem(&workers, &tid);
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Tracepoint path                                                      */
+/* ------------------------------------------------------------------ */
+
+struct trace_event_raw_fuse_request_send {
+	__u64  ent;	/* struct trace_entry common header */
+	dev_t  connection;
+	__u64  unique;
+	__u32  opcode;
+	__u32  len;
+};
+
+struct trace_event_raw_fuse_request_sent {
+	__u64  ent;	/* struct trace_entry common header */
+	dev_t  connection;
+	__u64  unique;
+	__u32  opcode;
+};
+
+struct trace_event_raw_fuse_request_end {
+	__u64  ent;	/* struct trace_entry common header */
+	dev_t  connection;
+	__u64  unique;
+	__u32  len;
+	__s32  error;
+};
+
+/*
+ * tp/fuse/fuse_request_send — insert request into in_flight keyed by unique.
+ * Fires on the application thread after unique has been assigned.
+ */
+SEC("tp/fuse/fuse_request_send")
+int tp_fuse_request_send(struct trace_event_raw_fuse_request_send *ctx)
+{
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct req_info ri = {};
+	u64 unique;
+	u32 pid, conn_id;
+	dev_t connection;
+
+	unique = ctx->unique;
+	if (!unique)
+		return 0;
+
+	connection = ctx->connection;
+	conn_id    = FUSE_MINOR(connection);
+	pid        = (u32)(pid_tgid >> 32);
+
+	if (target_pid && pid != (u32)target_pid)
+		return 0;
+	if (target_connid && conn_id != target_connid)
+		return 0;
+
+	ri.q_ts   = bpf_ktime_get_ns();
+	ri.unique = unique;
+	ri.opcode = ctx->opcode;
+	ri.pid    = pid;
+	ri.conn_id = conn_id;
+	bpf_get_current_comm(&ri.comm, sizeof(ri.comm));
+	bpf_map_update_elem(&in_flight, &unique, &ri, BPF_ANY);
+	return 0;
+}
+
+/*
+ * tp/fuse/fuse_request_sent — mark request as dequeued (D state).
+ * Fires on the daemon thread immediately after list_del_init.
+ * Sets d_ts directly in in_flight[unique] so userspace sees D state without
+ * the watermark; also registers the daemon thread as an active worker.
+ */
+SEC("tp/fuse/fuse_request_sent")
+int tp_fuse_request_sent(struct trace_event_raw_fuse_request_sent *ctx)
+{
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct req_info *rip;
+	struct worker_info wi = {};
+	u64 unique, now;
+
+	unique = ctx->unique;
+
+	rip = bpf_map_lookup_elem(&in_flight, &unique);
+	if (!rip)
+		return 0;	/* not a tracked request (filtered at send) */
+
+	now = bpf_ktime_get_ns();
+	rip->d_ts = now;
+
+	wi.d_ts    = now;
+	wi.conn_id = rip->conn_id;
+	wi.tid     = (u32)pid_tgid;
+	bpf_get_current_comm(&wi.comm, sizeof(wi.comm));
+	bpf_map_update_elem(&workers, &pid_tgid, &wi, BPF_ANY);
+	return 0;
+}
+
+/*
+ * tp/fuse/fuse_request_end — remove request from in_flight and workers.
+ */
+SEC("tp/fuse/fuse_request_end")
+int tp_fuse_request_end(struct trace_event_raw_fuse_request_end *ctx)
+{
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	u64 unique   = ctx->unique;
+
+	if (!unique)
+		return 0;
+
+	bpf_map_delete_elem(&in_flight, &unique);
+	bpf_map_delete_elem(&workers, &pid_tgid);
 	return 0;
 }
 

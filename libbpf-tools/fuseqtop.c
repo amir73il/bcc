@@ -577,6 +577,14 @@ static void sig_int(int signo)
 	exiting = 1;
 }
 
+static bool fuse_recv_tp_available(void)
+{
+	return access("/sys/kernel/tracing/events/fuse/fuse_request_sent",
+		      F_OK) == 0 ||
+	       access("/sys/kernel/debug/tracing/events/fuse/fuse_request_sent",
+		      F_OK) == 0;
+}
+
 int main(int argc, char **argv)
 {
 	/* Make stdout line-buffered so output appears even when not a tty. */
@@ -597,7 +605,7 @@ int main(int argc, char **argv)
 	char dequeue_fn_buf[256];
 	const char *enqueue_fn;
 	const char *dequeue_fn;
-	struct ksyms *ksyms;
+	bool use_tracepoints;
 	int err;
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
@@ -629,29 +637,54 @@ int main(int argc, char **argv)
 	obj->rodata->target_pid    = target_pid;
 	obj->rodata->target_connid = target_connid;
 
-	/*
-	 * Resolve enqueue and dequeue symbols at runtime:
-	 *
-	 * Enqueue (Q events):
-	 *   fuse_dev_queue_req       — 6.12+, req is PARM2
-	 *   queue_request_and_unlock — 5.15,  req is PARM2 (same probe works)
-	 *
-	 * Dequeue (D events):
-	 *   fuse_dev_do_read.constprop.N — splice() path, needs manual attach
-	 *   fuse_dev_read                — regular read() path, auto-attaches
-	 *
-	 * Both dequeue probes require entry+exit pairs.  The entry stashes
-	 * fud for the exit; the exit (ret>0) does the FIFO pop and D-marking.
-	 */
-	ksyms = ksyms__load();
-	if (!ksyms) {
-		warn("failed to load /proc/kallsyms\n");
-		err = 1;
-		goto cleanup_obj;
-	}
-	{
-		const struct ksym *ksym;
+	use_tracepoints = fuse_recv_tp_available();
 
+	if (use_tracepoints) {
+		fprintf(stderr, "using tracepoints (fuse_request_sent found)\n");
+		bpf_program__set_autoload(obj->progs.fuse_dev_queue_req_entry,
+					  false);
+		bpf_program__set_autoload(obj->progs.fuse_dev_queue_req_exit,
+					  false);
+		bpf_program__set_autoload(obj->progs.fuse_dev_do_read_entry,
+					  false);
+		bpf_program__set_autoload(obj->progs.fuse_dev_do_read_exit,
+					  false);
+		bpf_program__set_autoload(obj->progs.fuse_dev_read_entry,
+					  false);
+		bpf_program__set_autoload(obj->progs.fuse_dev_read_exit,
+					  false);
+		bpf_program__set_autoload(obj->progs.fuse_request_end_entry,
+					  false);
+		enqueue_fn = NULL;
+		dequeue_fn = NULL;
+	} else {
+		/*
+		 * Kprobe path: disable tracepoint programs and resolve
+		 * enqueue/dequeue symbols from /proc/kallsyms.
+		 *
+		 * Enqueue:
+		 *   fuse_dev_queue_req       — 6.12+, req is PARM2
+		 *   queue_request_and_unlock — 5.15,  req is PARM2
+		 *
+		 * Dequeue (D state / watermark):
+		 *   fuse_dev_do_read.constprop.N — splice() path, manual attach
+		 *   fuse_dev_read                — regular read() path, auto
+		 */
+		bpf_program__set_autoload(obj->progs.tp_fuse_request_send,
+					  false);
+		bpf_program__set_autoload(obj->progs.tp_fuse_request_sent,
+					  false);
+		bpf_program__set_autoload(obj->progs.tp_fuse_request_end,
+					  false);
+
+		struct ksyms *ksyms = ksyms__load();
+		if (!ksyms) {
+			warn("failed to load /proc/kallsyms\n");
+			err = 1;
+			goto cleanup_obj;
+		}
+
+		const struct ksym *ksym;
 		ksym = ksyms__get_symbol(ksyms, "fuse_dev_queue_req");
 		if (!ksym)
 			ksym = ksyms__get_symbol_prefix(ksyms,
@@ -674,39 +707,40 @@ int main(int argc, char **argv)
 		} else {
 			dequeue_fn = NULL;
 		}
-	}
-	ksyms__free(ksyms);
+		ksyms__free(ksyms);
 
-	if (!enqueue_fn) {
-		warn("WARNING: neither fuse_dev_queue_req nor "
-		     "queue_request_and_unlock found; Q events disabled\n");
-		bpf_program__set_autoload(obj->progs.fuse_dev_queue_req_entry,
-					  false);
-		bpf_program__set_autoload(obj->progs.fuse_dev_queue_req_exit,
-					  false);
-	} else {
-		bpf_program__set_autoattach(obj->progs.fuse_dev_queue_req_entry,
-					    false);
-		bpf_program__set_autoattach(obj->progs.fuse_dev_queue_req_exit,
-					    false);
-	}
+		if (!enqueue_fn) {
+			warn("WARNING: neither fuse_dev_queue_req nor "
+			     "queue_request_and_unlock found; "
+			     "Q events disabled\n");
+			bpf_program__set_autoload(
+				obj->progs.fuse_dev_queue_req_entry, false);
+			bpf_program__set_autoload(
+				obj->progs.fuse_dev_queue_req_exit, false);
+		} else {
+			bpf_program__set_autoattach(
+				obj->progs.fuse_dev_queue_req_entry, false);
+			bpf_program__set_autoattach(
+				obj->progs.fuse_dev_queue_req_exit, false);
+		}
 
-	if (!dequeue_fn) {
-		warn("WARNING: fuse_dev_do_read.constprop not found; "
-		     "splice() read path D events disabled\n");
-		bpf_program__set_autoload(obj->progs.fuse_dev_do_read_entry,
-					  false);
-		bpf_program__set_autoload(obj->progs.fuse_dev_do_read_exit,
-					  false);
-	} else {
-		/*
-		 * fuse_dev_read auto-attaches via its SEC() name.
-		 * fuse_dev_do_read.constprop.N needs manual attachment.
-		 */
-		bpf_program__set_autoattach(obj->progs.fuse_dev_do_read_entry,
-					    false);
-		bpf_program__set_autoattach(obj->progs.fuse_dev_do_read_exit,
-					    false);
+		if (!dequeue_fn) {
+			warn("WARNING: fuse_dev_do_read.constprop not found; "
+			     "splice() read path D events disabled\n");
+			bpf_program__set_autoload(
+				obj->progs.fuse_dev_do_read_entry, false);
+			bpf_program__set_autoload(
+				obj->progs.fuse_dev_do_read_exit, false);
+		} else {
+			/*
+			 * fuse_dev_read auto-attaches via its SEC() name.
+			 * fuse_dev_do_read.constprop.N needs manual attachment.
+			 */
+			bpf_program__set_autoattach(
+				obj->progs.fuse_dev_do_read_entry, false);
+			bpf_program__set_autoattach(
+				obj->progs.fuse_dev_do_read_exit, false);
+		}
 	}
 
 	err = fuseqtop_bpf__load(obj);
