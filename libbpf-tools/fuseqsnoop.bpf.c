@@ -2,7 +2,21 @@
 // Copyright (c) 2026 CTERA Networks
 //
 // Trace FUSE request lifecycle: enqueue, dequeue, and response.
-// Uses kprobes on fuse_dev_queue_req, fuse_dev_do_read, fuse_request_end.
+//
+// Two probe strategies, selected at runtime by fuseqsnoop.c:
+//
+// Tracepoint path (preferred, kernel with fuse_request_sent tracepoint):
+//   tp/fuse/fuse_request_send  — Q event, fires on app thread after unique assigned
+//   tp/fuse/fuse_request_sent  — D event, fires on daemon thread after list_del_init
+//   tp/fuse/fuse_request_end   — W+R events, fires at completion
+//   D events carry unique+opcode (reliable); pending/dequeue_ts keyed by unique.
+//
+// Kprobe path (fallback, older kernels without fuse_request_sent):
+//   kprobe/kretprobe fuse_dev_queue_req  — Q event
+//   kprobe/kretprobe fuse_dev_do_read    — D event (no unique at D time)
+//   kprobe/kretprobe fuse_dev_read       — D event (regular read() path)
+//   kprobe           fuse_request_end    — W+R events
+//   pending/dequeue_ts keyed by req_ptr/pid_tgid respectively.
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
@@ -423,6 +437,193 @@ int BPF_KPROBE(fuse_request_end_entry)
 
 out_delete:
 	bpf_map_delete_elem(&pending, &req_ptr);
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Tracepoint path                                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Minimal trace_event_raw_* structs for the fuse tracepoints.
+ * Only the event-specific fields (after the common 8-byte header) are
+ * declared; CO-RE resolves their actual offsets from the fuse module BTF.
+ * Field names must exactly match the TP_STRUCT__entry() definitions in
+ * fs/fuse/fuse_trace.h.
+ */
+struct trace_event_raw_fuse_request_send {
+	__u64  ent;	/* struct trace_entry common header */
+	dev_t  connection;
+	__u64  unique;
+	__u32  opcode;
+	__u32  len;
+};
+
+struct trace_event_raw_fuse_request_sent {
+	__u64  ent;	/* struct trace_entry common header */
+	dev_t  connection;
+	__u64  unique;
+	__u32  opcode;
+};
+
+struct trace_event_raw_fuse_request_end {
+	__u64  ent;	/* struct trace_entry common header */
+	dev_t  connection;
+	__u64  unique;
+	__u32  len;
+	__s32  error;
+};
+
+/*
+ * tp/fuse/fuse_request_send — Q event.
+ * Fires on the application thread after the unique ID has been assigned,
+ * just before the request is added to fiq->pending.
+ */
+SEC("tp/fuse/fuse_request_send")
+int tp_fuse_request_send(struct trace_event_raw_fuse_request_send *ctx)
+{
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct pending_info pi = {};
+	struct event e = {};
+	u64 unique;
+	u32 opcode, conn_id;
+	dev_t connection;
+
+	unique = ctx->unique;
+	if (!unique)
+		return 0;	/* FUSE_NOTIFY_REPLY */
+
+	opcode     = ctx->opcode;
+	connection = ctx->connection;
+	conn_id    = FUSE_MINOR(connection);
+
+	e.pid = (u32)(pid_tgid >> 32);
+	if (target_pid && e.pid != (u32)target_pid)
+		return 0;
+	if (target_connid && conn_id != target_connid)
+		return 0;
+
+	e.ts_ns   = bpf_ktime_get_ns();
+	e.unique  = unique;
+	e.opcode  = opcode;
+	e.conn_id = conn_id;
+	e.evt     = FUSEQ_Q;
+	bpf_get_current_comm(&e.comm, sizeof(e.comm));
+
+	pi.ts_ns   = e.ts_ns;
+	pi.opcode  = opcode;
+	pi.pid     = e.pid;
+	pi.conn_id = conn_id;
+	__builtin_memcpy(pi.comm, e.comm, sizeof(pi.comm));
+	bpf_map_update_elem(&pending, &unique, &pi, BPF_ANY);
+
+	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &e, sizeof(e));
+	return 0;
+}
+
+/*
+ * tp/fuse/fuse_request_sent — D event.
+ * Fires on the daemon thread immediately after list_del_init removes the
+ * request from fiq->pending.  Unlike the kretprobe path, this carries the
+ * unique ID, so D events are properly correlated with their Q events.
+ * Only emits for requests already in the pending map (respects pid filter).
+ */
+SEC("tp/fuse/fuse_request_sent")
+int tp_fuse_request_sent(struct trace_event_raw_fuse_request_sent *ctx)
+{
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct pending_info *pip;
+	struct event e = {};
+	u64 unique, ts;
+	u32 opcode, conn_id;
+	dev_t connection;
+
+	unique = ctx->unique;
+	pip = bpf_map_lookup_elem(&pending, &unique);
+	if (!pip)
+		return 0;	/* not a tracked request (filtered out at Q) */
+
+	opcode     = ctx->opcode;
+	connection = ctx->connection;
+	conn_id    = FUSE_MINOR(connection);
+
+	ts          = bpf_ktime_get_ns();
+	e.ts_ns     = ts;
+	e.wait_ns   = ts - pip->ts_ns;
+	e.has_split = 1;
+	e.unique  = unique;
+	e.opcode  = opcode;
+	e.conn_id = conn_id;
+	e.evt     = FUSEQ_D;
+	e.pid     = (u32)(pid_tgid >> 32);
+	bpf_get_current_comm(&e.comm, sizeof(e.comm));
+
+	bpf_map_update_elem(&dequeue_ts, &unique, &ts, BPF_ANY);
+
+	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &e, sizeof(e));
+	return 0;
+}
+
+/*
+ * tp/fuse/fuse_request_end — W + R events.
+ * Fires at request completion; pending and dequeue_ts are keyed by unique.
+ */
+SEC("tp/fuse/fuse_request_end")
+int tp_fuse_request_end(struct trace_event_raw_fuse_request_end *ctx)
+{
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct pending_info *pip;
+	struct event e = {};
+	u64 unique, now;
+
+	unique = ctx->unique;
+	if (!unique)
+		return 0;
+
+	pip = bpf_map_lookup_elem(&pending, &unique);
+	if (!pip)
+		return 0;
+
+	if (target_pid && pip->pid != (u32)target_pid)
+		goto out_delete;
+	if (target_connid && pip->conn_id != target_connid)
+		goto out_delete;
+
+	now       = bpf_ktime_get_ns();
+	e.ts_ns   = now;
+	e.unique  = unique;
+	e.opcode  = pip->opcode;
+	e.conn_id = pip->conn_id;
+
+	{
+		u64 total  = now - pip->ts_ns;
+		u64 *d_tsp = bpf_map_lookup_elem(&dequeue_ts, &unique);
+
+		if (d_tsp && *d_tsp >= pip->ts_ns && *d_tsp <= now) {
+			e.wait_ns    = *d_tsp - pip->ts_ns;
+			e.process_ns = now - *d_tsp;
+			e.has_split  = 1;
+			bpf_map_delete_elem(&dequeue_ts, &unique);
+		} else {
+			e.wait_ns    = total;
+			e.process_ns = 0;
+			e.has_split  = 0;
+		}
+	}
+
+	e.evt = FUSEQ_W;
+	e.pid = (u32)(pid_tgid >> 32);
+	bpf_get_current_comm(&e.comm, sizeof(e.comm));
+	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &e, sizeof(e));
+
+	e.evt   = FUSEQ_R;
+	e.pid   = pip->pid;
+	e.error = ctx->error;
+	__builtin_memcpy(e.comm, pip->comm, sizeof(e.comm));
+	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &e, sizeof(e));
+
+out_delete:
+	bpf_map_delete_elem(&pending, &unique);
 	return 0;
 }
 

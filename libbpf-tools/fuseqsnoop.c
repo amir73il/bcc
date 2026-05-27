@@ -56,8 +56,12 @@ const char argp_program_doc[] =
 "  W  worker daemon thread that completed the request\n"
 "  R  request completed, with total Q->R latency in milliseconds\n"
 "\n"
-"W and R are emitted together at completion time.  W provides a reliable\n"
-"map from FUSE daemon TID to unique request ID, which is not available at D.\n"
+"When the kernel exposes the fuse_request_sent tracepoint,\n"
+"all three tracepoints are used: D events carry the unique ID and opcode,\n"
+"and the Q->D / D->R latency split is fully reliable.\n"
+"On older kernels the tool falls back to kprobes: D events show only the\n"
+"daemon TID (no request correlation), and W provides the daemon-TID to\n"
+"unique-ID mapping at completion time.\n"
 "\n"
 "The connection ID (-c) corresponds to the directory number under\n"
 "/sys/fs/fuse/connections/ and the MINOR number of /dev/fuse.\n"
@@ -212,7 +216,11 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 data_sz)
 	printf("%-3s %-7u %-16s %-6u ",
 	       evt_str, e.pid, e.comm, e.conn_id);
 
-	if (e.evt == FUSEQ_D) {
+	/*
+	 * Kprobe path: D events have unique==0 (not known at dequeue time).
+	 * Tracepoint path: D events carry unique+opcode from the trace record.
+	 */
+	if (e.evt == FUSEQ_D && !e.unique) {
 		printf("%-16s %-20s", "-", "-");
 	} else {
 		printf("%-16s %-20llu",
@@ -220,7 +228,10 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 data_sz)
 		       (unsigned long long)e.unique);
 	}
 
-	if (e.evt == FUSEQ_W) {
+	if (e.evt == FUSEQ_D && e.has_split) {
+		/* Tracepoint path: wait time (Q→D) is known at dequeue. */
+		printf(" %10.3f %10s %10s", e.wait_ns / 1e6, "", "");
+	} else if (e.evt == FUSEQ_W) {
 		/* Daemon perspective: show only server processing time (D→R). */
 		if (e.has_split)
 			printf(" %10s %10.3f %10s", "", e.process_ns / 1e6, "");
@@ -262,6 +273,22 @@ static void sig_int(int signo)
 	exiting = 1;
 }
 
+/*
+ * Check whether the fuse_request_sent tracepoint is present on the running
+ * kernel.  Its existence is the gate for the tracepoint path: when it is
+ * present we know that (a) the kernel has the new tracepoint set, and (b)
+ * the fuse_request_send tracepoint is no longer buggy.
+ *
+ * The tracepoint is exposed under debugfs or tracefs depending on the kernel
+ * configuration; try both mount points.
+ */
+static bool fuse_recv_tp_available(void)
+{
+	return access("/sys/kernel/tracing/events/fuse/fuse_request_sent",
+		      F_OK) == 0 ||
+	       access("/sys/kernel/debug/tracing/events/fuse/fuse_request_sent",
+		      F_OK) == 0;
+}
 
 int main(int argc, char **argv)
 {
@@ -284,7 +311,7 @@ int main(int argc, char **argv)
 	char dequeue_fn_buf[256];
 	const char *enqueue_fn;
 	const char *dequeue_fn;
-	struct ksyms *ksyms;
+	bool use_tracepoints;
 	int err;
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
@@ -311,25 +338,66 @@ int main(int argc, char **argv)
 	obj->rodata->target_connid = target_connid;
 
 	/*
-	 * Resolve enqueue and dequeue symbols at runtime:
+	 * Select probe strategy:
 	 *
-	 * Enqueue (Q events):
-	 *   fuse_dev_queue_req        — 6.12+, req is PARM2
-	 *   queue_request_and_unlock  — 5.15,  req is PARM2 (same probe works)
+	 * Tracepoint path (preferred):
+	 *   Used when fuse_request_sent tracepoint is present.  This implies
+	 *   the kernel has the full {send, recv, end} tracepoint set and that
+	 *   send is no longer buggy.  All kprobe programs are disabled.
 	 *
-	 * Dequeue (D events):
-	 *   fuse_dev_do_read.constprop.N — splice() path, needs manual attach
-	 *   fuse_dev_read                — regular read() path, auto-attaches
+	 * Kprobe path (fallback for older kernels):
+	 *   All tracepoint programs are disabled.  Enqueue and dequeue symbols
+	 *   are resolved from /proc/kallsyms because their names are not stable
+	 *   across kernel versions.
 	 */
-	ksyms = ksyms__load();
-	if (!ksyms) {
-		warn("failed to load /proc/kallsyms\n");
-		err = 1;
-		goto cleanup;
-	}
-	{
-		const struct ksym *ksym;
+	use_tracepoints = fuse_recv_tp_available();
 
+	if (use_tracepoints) {
+		fprintf(stderr, "using tracepoints (fuse_request_sent found)\n");
+		bpf_program__set_autoload(obj->progs.fuse_dev_queue_req_entry,
+					  false);
+		bpf_program__set_autoload(obj->progs.fuse_dev_queue_req_exit,
+					  false);
+		bpf_program__set_autoload(obj->progs.fuse_dev_do_read_entry,
+					  false);
+		bpf_program__set_autoload(obj->progs.fuse_dev_do_read_exit,
+					  false);
+		bpf_program__set_autoload(obj->progs.fuse_dev_read_entry,
+					  false);
+		bpf_program__set_autoload(obj->progs.fuse_dev_read_exit,
+					  false);
+		bpf_program__set_autoload(obj->progs.fuse_request_end_entry,
+					  false);
+		enqueue_fn  = NULL;
+		dequeue_fn  = NULL;
+	} else {
+		/*
+		 * Kprobe path: disable tracepoint programs and resolve
+		 * enqueue/dequeue symbols from /proc/kallsyms.
+		 *
+		 * Enqueue (Q events):
+		 *   fuse_dev_queue_req        — 6.12+, req is PARM2
+		 *   queue_request_and_unlock  — 5.15,  req is PARM2
+		 *
+		 * Dequeue (D events):
+		 *   fuse_dev_do_read.constprop.N — splice() path, manual attach
+		 *   fuse_dev_read                — regular read() path, auto
+		 */
+		bpf_program__set_autoload(obj->progs.tp_fuse_request_send,
+					  false);
+		bpf_program__set_autoload(obj->progs.tp_fuse_request_sent,
+					  false);
+		bpf_program__set_autoload(obj->progs.tp_fuse_request_end,
+					  false);
+
+		struct ksyms *ksyms = ksyms__load();
+		if (!ksyms) {
+			warn("failed to load /proc/kallsyms\n");
+			err = 1;
+			goto cleanup;
+		}
+
+		const struct ksym *ksym;
 		ksym = ksyms__get_symbol(ksyms, "fuse_dev_queue_req");
 		if (!ksym)
 			ksym = ksyms__get_symbol_prefix(ksyms,
@@ -352,30 +420,31 @@ int main(int argc, char **argv)
 		} else {
 			dequeue_fn = NULL;
 		}
-	}
-	ksyms__free(ksyms);
+		ksyms__free(ksyms);
 
-	if (!enqueue_fn) {
-		warn("WARNING: neither fuse_dev_queue_req nor "
-		     "queue_request_and_unlock found; Q events disabled\n");
-		bpf_program__set_autoload(obj->progs.fuse_dev_queue_req_entry,
-					  false);
-		bpf_program__set_autoload(obj->progs.fuse_dev_queue_req_exit,
-					  false);
-	} else {
-		bpf_program__set_autoattach(obj->progs.fuse_dev_queue_req_entry,
-					    false);
-		bpf_program__set_autoattach(obj->progs.fuse_dev_queue_req_exit,
-					    false);
-	}
+		if (!enqueue_fn) {
+			warn("WARNING: neither fuse_dev_queue_req nor "
+			     "queue_request_and_unlock found; "
+			     "Q events disabled\n");
+			bpf_program__set_autoload(
+				obj->progs.fuse_dev_queue_req_entry, false);
+			bpf_program__set_autoload(
+				obj->progs.fuse_dev_queue_req_exit, false);
+		} else {
+			bpf_program__set_autoattach(
+				obj->progs.fuse_dev_queue_req_entry, false);
+			bpf_program__set_autoattach(
+				obj->progs.fuse_dev_queue_req_exit, false);
+		}
 
-	if (!dequeue_fn) {
-		warn("WARNING: fuse_dev_do_read.constprop not found; "
-		     "splice() read path D events disabled\n");
-		bpf_program__set_autoload(obj->progs.fuse_dev_do_read_entry,
-					  false);
-		bpf_program__set_autoload(obj->progs.fuse_dev_do_read_exit,
-					  false);
+		if (!dequeue_fn) {
+			warn("WARNING: fuse_dev_do_read.constprop not found; "
+			     "splice() read path D events disabled\n");
+			bpf_program__set_autoload(
+				obj->progs.fuse_dev_do_read_entry, false);
+			bpf_program__set_autoload(
+				obj->progs.fuse_dev_do_read_exit, false);
+		}
 	}
 
 	err = fuseqsnoop_bpf__load(obj);
