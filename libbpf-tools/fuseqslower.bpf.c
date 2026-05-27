@@ -3,17 +3,18 @@
 //
 // Trace FUSE requests slower than a threshold, with wait/process split.
 //
-// For synchronous FUSE daemons (libfuse), fuse_request_end is called by
-// the daemon thread that processed the request.  We record the timestamp
-// when that thread returned from fuse_dev_do_read (i.e. took a request
-// off the queue) and use it to split total latency into:
+// Two probe strategies, selected at runtime by fuseqslower.c:
 //
-//   wait_ns    = dequeue_ts - q_ts   (time in fiq->pending queue)
-//   process_ns = r_ts - dequeue_ts   (time being processed by daemon)
+// Tracepoint path (preferred, kernel with fuse_request_sent tracepoint):
+//   tp/fuse/fuse_request_send  — record request at enqueue; pending keyed by unique
+//   tp/fuse/fuse_request_sent  — record dequeue timestamp; dequeue_ts keyed by unique
+//   tp/fuse/fuse_request_end   — compute latency split and emit event
 //
-// If the current task at fuse_request_end is not a known daemon thread
-// (async/background requests), has_split is set to 0 and only the total
-// latency is reported.
+// Kprobe path (fallback, older kernels):
+//   kprobe/kretprobe fuse_dev_queue_req  — record request at enqueue
+//   kprobe/kretprobe fuse_dev_do_read    — record dequeue timestamp
+//   kprobe           fuse_request_end    — compute latency split and emit event
+//   pending keyed by req_ptr; dequeue_ts keyed by pid_tgid.
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
@@ -289,6 +290,153 @@ int BPF_KPROBE(fuse_request_end_entry)
 
 out_delete:
 	bpf_map_delete_elem(&pending, &req_ptr);
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Tracepoint path                                                      */
+/* ------------------------------------------------------------------ */
+
+struct trace_event_raw_fuse_request_send {
+	__u64  ent;	/* struct trace_entry common header */
+	dev_t  connection;
+	__u64  unique;
+	__u32  opcode;
+	__u32  len;
+};
+
+struct trace_event_raw_fuse_request_sent {
+	__u64  ent;	/* struct trace_entry common header */
+	dev_t  connection;
+	__u64  unique;
+	__u32  opcode;
+};
+
+struct trace_event_raw_fuse_request_end {
+	__u64  ent;	/* struct trace_entry common header */
+	dev_t  connection;
+	__u64  unique;
+	__u32  len;
+	__s32  error;
+};
+
+/*
+ * tp/fuse/fuse_request_send — record enqueue timestamp in pending[unique].
+ * Fires on the application thread after the unique ID has been assigned.
+ */
+SEC("tp/fuse/fuse_request_send")
+int tp_fuse_request_send(struct trace_event_raw_fuse_request_send *ctx)
+{
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct pending_info pi = {};
+	u64 unique;
+	u32 pid, conn_id;
+	dev_t connection;
+
+	unique = ctx->unique;
+	if (!unique)
+		return 0;
+
+	connection = ctx->connection;
+	conn_id    = FUSE_MINOR(connection);
+	pid        = (u32)(pid_tgid >> 32);
+
+	if (target_pid && pid != (u32)target_pid)
+		return 0;
+	if (target_connid && conn_id != target_connid)
+		return 0;
+
+	pi.ts_ns   = bpf_ktime_get_ns();
+	pi.opcode  = ctx->opcode;
+	pi.pid     = pid;
+	pi.conn_id = conn_id;
+	bpf_get_current_comm(&pi.comm, sizeof(pi.comm));
+	bpf_map_update_elem(&pending, &unique, &pi, BPF_ANY);
+	return 0;
+}
+
+/*
+ * tp/fuse/fuse_request_sent — record dequeue timestamp in dequeue_ts[unique].
+ * Fires on the daemon thread immediately after list_del_init.
+ * Only records for requests already in pending (respects pid filter).
+ */
+SEC("tp/fuse/fuse_request_sent")
+int tp_fuse_request_sent(struct trace_event_raw_fuse_request_sent *ctx)
+{
+	u64 unique = ctx->unique;
+	u64 ts;
+
+	if (!bpf_map_lookup_elem(&pending, &unique))
+		return 0;
+
+	ts = bpf_ktime_get_ns();
+	bpf_map_update_elem(&dequeue_ts, &unique, &ts, BPF_ANY);
+	return 0;
+}
+
+/*
+ * tp/fuse/fuse_request_end — compute latency split and emit event if
+ * the request exceeds the configured threshold.
+ * pending and dequeue_ts are keyed by unique.
+ */
+SEC("tp/fuse/fuse_request_end")
+int tp_fuse_request_end(struct trace_event_raw_fuse_request_end *ctx)
+{
+	struct pending_info *pip;
+	struct event e = {};
+	u64 unique, now, total;
+
+	unique = ctx->unique;
+	if (!unique)
+		return 0;
+
+	pip = bpf_map_lookup_elem(&pending, &unique);
+	if (!pip)
+		return 0;
+
+	now   = bpf_ktime_get_ns();
+	total = now - pip->ts_ns;
+
+	e.ts_ns   = now;
+	e.unique  = unique;
+	e.opcode  = pip->opcode;
+	e.pid     = pip->pid;
+	e.conn_id = pip->conn_id;
+	e.error   = ctx->error;
+	__builtin_memcpy(e.comm, pip->comm, sizeof(e.comm));
+
+	{
+		u64 *d_tsp = bpf_map_lookup_elem(&dequeue_ts, &unique);
+
+		if (d_tsp && *d_tsp >= pip->ts_ns && *d_tsp <= now) {
+			e.wait_ns    = *d_tsp - pip->ts_ns;
+			e.process_ns = now - *d_tsp;
+			e.has_split  = 1;
+			bpf_map_delete_elem(&dequeue_ts, &unique);
+		} else {
+			e.wait_ns    = total;
+			e.process_ns = 0;
+			e.has_split  = 0;
+		}
+	}
+
+	if (min_wait_ns) {
+		u64 cmp = e.has_split ? e.wait_ns : total;
+		if (cmp < min_wait_ns)
+			goto out_delete;
+	} else if (min_process_ns) {
+		u64 cmp = e.has_split ? e.process_ns : total;
+		if (cmp < min_process_ns)
+			goto out_delete;
+	} else {
+		if (total < min_lat_ns)
+			goto out_delete;
+	}
+
+	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &e, sizeof(e));
+
+out_delete:
+	bpf_map_delete_elem(&pending, &unique);
 	return 0;
 }
 
