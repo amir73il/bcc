@@ -253,6 +253,18 @@ static __u64 get_now_ns(void)
 	return (__u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
+/*
+ * Convert a BPF/userspace timestamp delta to milliseconds.
+ * BPF ktime can be slightly ahead of userspace CLOCK_MONOTONIC; guard
+ * against unsigned wraparound that would print ~UINT64_MAX as ms.
+ */
+static double ns_to_ms(__u64 end, __u64 start)
+{
+	if (end <= start)
+		return 0.0;
+	return (double)(end - start) / 1e6;
+}
+
 /* ------------------------------------------------------------------ */
 /* Snapshot structures used for sorting and display.                   */
 
@@ -410,13 +422,11 @@ static void display_snapshot(struct fuseqtop_bpf *obj)
 				rd->req_ptr  = cur_key;
 				rd->ri       = ri;
 				rd->is_D     = (ri.d_ts != 0);
-				rd->total_ms = (double)(now - ri.q_ts) / 1e6;
+				rd->total_ms = ns_to_ms(now, ri.q_ts);
 
 				if (ri.d_ts) {
-					rd->wait_ms = (double)(ri.d_ts - ri.q_ts)
-						      / 1e6;
-					rd->serv_ms = (double)(now - ri.d_ts)
-						      / 1e6;
+					rd->wait_ms = ns_to_ms(ri.d_ts, ri.q_ts);
+					rd->serv_ms = ns_to_ms(now, ri.d_ts);
 				} else {
 					rd->wait_ms = rd->total_ms;
 					rd->serv_ms = 0.0;
@@ -461,7 +471,7 @@ next_req:
 
 				wd->pid_tgid = cur_key;
 				wd->wi       = wi;
-				wd->serv_ms  = (double)(now - wi.d_ts) / 1e6;
+				wd->serv_ms  = ns_to_ms(now, wi.d_ts);
 			}
 next_worker:
 			prev_key = cur_key;
